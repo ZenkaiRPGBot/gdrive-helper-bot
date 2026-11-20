@@ -16,7 +16,7 @@ services:
       - key: LOG_CHANNEL_ID
         value: "-1004495645007"
       - key: RENDER_EMAIL
-        value: "2305101270081@paruluniversity.ac.in"
+        value: "giyanrtjd@gmail.com"
       - key: RENDER_SERVICE_NAME
         value: "gdrive-helper-bot"
       - key: RENDER_USED_HOURS

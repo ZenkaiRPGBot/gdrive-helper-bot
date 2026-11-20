@@ -18,7 +18,7 @@ OWNER_ID = int(os.getenv("OWNER_ID", "986380678"))
 LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID", "-1004495645007").strip()
 
 # Render Cloud Hosting Metadata
-RENDER_EMAIL = os.getenv("RENDER_EMAIL", "2305101270081@paruluniversity.ac.in")
+RENDER_EMAIL = os.getenv("RENDER_EMAIL", "giyanrtjd@gmail.com")
 RENDER_SERVICE_NAME = os.getenv("RENDER_SERVICE_NAME", "gdrive-helper-bot")
 RENDER_REPO = "ZenkaiRPGBot/gdrive-helper-bot"
 RENDER_USED_HOURS = float(os.getenv("RENDER_USED_HOURS", "475.0"))
