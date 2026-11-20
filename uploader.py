@@ -108,11 +108,14 @@ def generate_uploader_data(text: str) -> dict:
             f"https://t.me/kayitv"
         )
 
-    return {
-        "series_name": series_name,
-        "gdrive_line": gdrive_line,
-        "bot1_block": bot1_block,
-        "bot2_block": bot2_block,
-        "captions_html": {q: make_caption(q) for q in ["360p", "480p", "720p", "1080p"]},
-        "captions_plain": {q: make_plain_caption(q) for q in ["360p", "480p", "720p", "1080p"]}
-    }
+    # Return separate messages with headers and below emoji for easy 1-tap copying
+    return [
+        "<b>Bot 1 Links (360p & 480p) 👇</b>",
+        f"<code>{bot1_block}</code>",
+        "<b>Bot 2 Links (720p & 1080p) 👇</b>",
+        f"<code>{bot2_block}</code>",
+        "<b>Caption for 360p / 480p / 720p 👇</b>",
+        make_caption("720p"),
+        "<b>Caption for 1080p 👇</b>",
+        make_caption("1080p")
+    ]
