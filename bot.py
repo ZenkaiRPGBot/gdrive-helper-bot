@@ -251,6 +251,10 @@ async def cb_ping_refresh(callback: types.CallbackQuery, bot: Bot):
 @dp.message(Command("render"))
 @dp.message(Command("status"))
 async def cmd_usage(message: types.Message, bot: Bot):
+    if message.from_user.id != OWNER_ID:
+        await message.reply("Access restricted to bot owner.")
+        return
+
     text, markup = await build_usage_card_text(bot)
     await message.reply(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
