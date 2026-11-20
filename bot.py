@@ -357,6 +357,7 @@ async def handle_text_message(message: types.Message, custom_text: str | None = 
         return
 
     formatted_text = await process_text_and_format(text, HTTP_SESSION)
+    await message.reply("<b>Google Drive Post 👇</b>", parse_mode=ParseMode.HTML)
     await message.reply(
         formatted_text,
         parse_mode=ParseMode.HTML,
