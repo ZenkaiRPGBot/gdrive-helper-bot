@@ -3,10 +3,21 @@ services:
     name: gdrive-helper-bot
     env: python
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    region: frankfurt
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: python -u bot.py
     envVars:
       - key: BOT_TOKEN
         sync: false
       - key: PING_URL
-        sync: false
+        value: "https://gdrive-helper-bot.onrender.com"
+      - key: OWNER_ID
+        value: "986380678"
+      - key: LOG_CHANNEL_ID
+        value: "-1004495645007"
+      - key: RENDER_EMAIL
+        value: "giyanrtjd@gmail.com"
+      - key: RENDER_SERVICE_NAME
+        value: "gdrive-helper-bot"
+      - key: PYTHONUNBUFFERED
+        value: "1"

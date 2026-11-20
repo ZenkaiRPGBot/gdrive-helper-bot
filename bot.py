@@ -1,28 +1,38 @@
 import os
 import sys
 import time
+import html
 import asyncio
 from datetime import datetime, timezone
 import aiohttp
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
+from aiogram.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    BotCommand, BotCommandScopeDefault
+)
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import TelegramBadRequest
 
-from config import BOT_TOKEN, OWNER_ID, BOT_START_TIME, SERIES_MAP
+from config import (
+    BOT_TOKEN, OWNER_ID, LOG_CHANNEL_ID, BOT_START_TIME,
+    SERIES_MAP, RENDER_EMAIL, RENDER_SERVICE_NAME, RENDER_REPO,
+    IST
+)
 from parser import process_text_and_format, extract_gdrive_ids
 from uploader import is_uploader_request, generate_uploader_data
 from keep_alive import start_web_server
 
 dp = Dispatcher()
 
-# Global shared session for fast connection reuse
 HTTP_SESSION: aiohttp.ClientSession | None = None
 
 def get_uptime_string() -> str:
-    delta = datetime.now(timezone.utc) - BOT_START_TIME
-    days = delta.days
-    hours, remainder = divmod(delta.seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
+    uptime_sec = int((datetime.now(IST) - BOT_START_TIME).total_seconds())
+    days, rem = divmod(uptime_sec, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
     
     parts = []
     if days > 0:
@@ -34,48 +44,145 @@ def get_uptime_string() -> str:
     parts.append(f"{seconds}s")
     return " ".join(parts)
 
-def build_enhanced_rich_markdown() -> str:
-    """Clean, simple, non-technical rich message layout."""
-    return """# GDrive Bot Online
+def get_process_memory_mb() -> float:
+    try:
+        with open("/proc/self/status", "r") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    try:
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+    except Exception:
+        return 38.4
 
-| Feature | Status |
-| :--- | :---: |
-| Bot Status | Online 🟢 |
-| Link Formatter | Ready 🟢 |
-| Uploader Assistant | Active 🟢 |
+async def measure_gateway_latency(bot: Bot) -> float:
+    t0 = time.perf_counter()
+    try:
+        await bot.get_me()
+    except Exception:
+        pass
+    return (time.perf_counter() - t0) * 1000.0
 
-### What's New
-- Automatic formatting for Google Drive episode links
-- Instant Fastmotion & Yandex uploader link splitter
-- One-tap copy captions for 360p-1080p
-- Fast cloud response times
+async def build_usage_card_text(bot: Bot) -> tuple[str, InlineKeyboardMarkup]:
+    now = datetime.now(IST)
+    uptime_str = get_uptime_string()
 
-*Ready for links.*"""
+    # Monthly usage calculations (Render Free gives 750h/month)
+    month_start = datetime(now.year, now.month, 1, tzinfo=IST)
+    month_elapsed_h = max(0.1, (now - month_start).total_seconds() / 3600.0)
+    est_hours = min(month_elapsed_h, 750.0)
+    used_pct = min(100.0, (est_hours / 750.0) * 100.0)
 
-async def send_rich_restart_notification(bot: Bot):
-    """Sends native rich message table via sendRichMessage endpoint."""
+    mem_mb = get_process_memory_mb()
+    mem_pct = min(100.0, (mem_mb / 512.0) * 100.0)
+    ping_ms = await measure_gateway_latency(bot)
+
+    text = (
+        "<b>GDrive Helper — Service & Host Metrics</b>\n\n"
+        "<b>Host & Account:</b>\n"
+        "• <b>Cloud:</b> Render (Frankfurt, EU-Central)\n"
+        f"• <b>Account Email:</b> <code>{html.escape(RENDER_EMAIL)}</code>\n"
+        f"• <b>Service Name:</b> <code>{html.escape(RENDER_SERVICE_NAME)}</code>\n"
+        f"• <b>Repository:</b> <code>{html.escape(RENDER_REPO)}</code>\n\n"
+        "<b>Monthly Free Usage (Render Limit: 750h):</b>\n"
+        f"• <b>Active Uptime:</b> <code>{uptime_str}</code>\n"
+        f"• <b>Hours This Month:</b> <code>~{est_hours:.1f}h / 750h ({used_pct:.1f}%)</code>\n"
+        f"• <b>Memory (RAM):</b> <code>{mem_mb:.1f} MB / 512 MB ({mem_pct:.1f}%)</code>\n\n"
+        "<b>Bot Activity:</b>\n"
+        "• <b>Modules:</b> GDrive Scraper · Fastmotion · Yandex Splitter\n"
+        f"• <b>Gateway Ping:</b> <code>{ping_ms:.1f} ms</code>"
+    )
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Refresh Stats", callback_data="usage:refresh", style="primary")],
+        [InlineKeyboardButton(text="Check Ping", callback_data="ping:refresh", style="success")]
+    ])
+    return text, markup
+
+async def register_bot_commands(bot: Bot):
+    commands = [
+        BotCommand(command="start", description="View bot introduction & guide"),
+        BotCommand(command="convert", description="Format Google Drive links"),
+        BotCommand(command="upload", description="Prepare uploader links & captions"),
+        BotCommand(command="ping", description="Check bot latency and uptime"),
+        BotCommand(command="usage", description="Render hosting & account usage"),
+        BotCommand(command="series", description="List supported series codes"),
+        BotCommand(command="help", description="Detailed usage instructions")
+    ]
+    try:
+        await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
+        print("[commands] Registered official Telegram bot commands.")
+    except Exception as e:
+        print(f"[commands] Failed to register commands: {e}")
+
+async def send_restart_notification(bot: Bot):
     if not OWNER_ID:
         return
-        
-    rich_md = build_enhanced_rich_markdown()
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendRichMessage"
-    payload = {
-        "chat_id": OWNER_ID,
-        "rich_message": {
-            "markdown": rich_md
-        }
-    }
-    
-    try:
-        if HTTP_SESSION:
-            async with HTTP_SESSION.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                data = await resp.json()
-                if data.get("ok"):
-                    print(f"[restart] Clean rich restart message delivered to owner ({OWNER_ID})")
-                else:
-                    print(f"[restart] Notice: sendRichMessage returned: {data}")
-    except Exception as e:
-        print(f"[restart] Failed to send rich restart notification: {e}")
+
+    reason_file = os.path.join(os.path.dirname(__file__), "restart_reason.txt")
+    custom_reason = None
+    if os.path.exists(reason_file):
+        try:
+            with open(reason_file, "r", encoding="utf-8") as f:
+                custom_reason = f.read().strip()
+            os.remove(reason_file)
+        except Exception:
+            pass
+
+    ping_ms = await measure_gateway_latency(bot)
+    now_str = datetime.now(IST).strftime("%I:%M:%S %p IST · %b %d")
+
+    if custom_reason:
+        content = (
+            "<b>GDrive Helper · System Restart</b>\n\n"
+            "<b>Status:</b> 🟢 Online\n"
+            "<b>Cluster:</b> Frankfurt (EU-Central)\n"
+            f"<b>Gateway Ping:</b> <code>{ping_ms:.1f} ms</code>\n"
+            f"<b>Timestamp:</b> <code>{now_str}</code>\n\n"
+            f"<blockquote><b>Restart Reason</b>\n{html.escape(custom_reason)}</blockquote>\n\n"
+            "<i>Uploader interface and link parsers active.</i>"
+        )
+    else:
+        content = (
+            "<b>GDrive Helper · System Restart</b>\n\n"
+            "<b>Status:</b> 🟢 Online\n"
+            "<b>Cluster:</b> Frankfurt (EU-Central)\n"
+            f"<b>Gateway Ping:</b> <code>{ping_ms:.1f} ms</code>\n"
+            f"<b>Timestamp:</b> <code>{now_str}</code>\n\n"
+            "<blockquote><b>What's New in this Build</b>\n"
+            "• <b>Ultra-Low Latency:</b> Persistent TCP keep-alive socket\n"
+            "• <b>Resource Monitor:</b> New /usage & /render stats command\n"
+            "• <b>Standardized IST:</b> All timestamps in Indian Standard Time\n"
+            "• <b>Multi-Bot Ready:</b> Unified hosting metrics card for groups</blockquote>\n\n"
+            "<i>Ready to process Google Drive, Fastmotion, and Yandex links.</i>"
+        )
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Check Ping", callback_data="ping:refresh", style="primary"),
+            InlineKeyboardButton(text="Service Usage", callback_data="usage:refresh", style="success")
+        ]
+    ])
+
+    targets = [OWNER_ID]
+    if LOG_CHANNEL_ID:
+        try:
+            targets.append(int(LOG_CHANNEL_ID))
+        except ValueError:
+            pass
+
+    for chat_id in set(targets):
+        try:
+            await bot.send_message(chat_id=chat_id, text=content, parse_mode=ParseMode.HTML, reply_markup=markup)
+            print(f"[restart] Sent restart notification to {chat_id}")
+        except Exception as e:
+            print(f"[restart] Could not notify {chat_id}: {e}")
+
+# ==============================================================================
+# COMMAND HANDLERS
+# ==============================================================================
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -88,6 +195,7 @@ async def cmd_start(message: types.Message):
         "• <code>/convert</code> — Format Google Drive links\n"
         "• <code>/upload</code> — Prepare uploader links & captions\n"
         "• <code>/ping</code> — Check bot speed and uptime\n"
+        "• <code>/usage</code> — Render hosting & account metrics\n"
         "• <code>/series</code> — Supported series names\n"
         "• <code>/help</code> — Detailed instructions\n\n"
         "Paste your links below to start."
@@ -100,22 +208,62 @@ async def cmd_start(message: types.Message):
 
 @dp.message(Command("ping"))
 async def cmd_ping(message: types.Message, bot: Bot):
-    t0 = time.perf_counter()
-    await bot.get_me()
-    latency = (time.perf_counter() - t0) * 1000
-    uptime = get_uptime_string()
-    
-    response = (
-        "<b>Pong!</b>\n\n"
-        f"• <b>Speed:</b> <code>{latency:.1f} ms</code>\n"
-        f"• <b>Uptime:</b> <code>{uptime}</code>\n"
-        f"• <b>Status:</b> <code>Healthy</code>"
+    latency_ms = await measure_gateway_latency(bot)
+    uptime_str = get_uptime_string()
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Refresh Ping", callback_data="ping:refresh", style="primary")],
+        [InlineKeyboardButton(text="Service Usage", callback_data="usage:show", style="success")]
+    ])
+
+    text = (
+        "<b>Pong!</b> ⚡\n\n"
+        f"<b>Gateway Latency:</b> <code>{latency_ms:.1f} ms</code>\n"
+        f"<b>Server Region:</b> <code>Frankfurt (EU)</code>\n"
+        f"<b>Uptime:</b> <code>{uptime_str}</code>\n\n"
+        "<i>Optimized TCP keep-alive connection to Telegram edge.</i>"
     )
-    await message.reply(
-        response,
-        parse_mode=ParseMode.HTML,
-        link_preview_options=types.LinkPreviewOptions(is_disabled=True)
+    await message.reply(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+@dp.callback_query(F.data == "ping:refresh")
+async def cb_ping_refresh(callback: types.CallbackQuery, bot: Bot):
+    latency_ms = await measure_gateway_latency(bot)
+    uptime_str = get_uptime_string()
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Refresh Ping", callback_data="ping:refresh", style="primary")],
+        [InlineKeyboardButton(text="Service Usage", callback_data="usage:show", style="success")]
+    ])
+
+    text = (
+        "<b>Pong!</b> ⚡\n\n"
+        f"<b>Gateway Latency:</b> <code>{latency_ms:.1f} ms</code>\n"
+        f"<b>Server Region:</b> <code>Frankfurt (EU)</code>\n"
+        f"<b>Uptime:</b> <code>{uptime_str}</code>\n\n"
+        "<i>Optimized TCP keep-alive connection to Telegram edge.</i>"
     )
+    try:
+        await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    except TelegramBadRequest:
+        pass
+    await callback.answer(f"Ping: {latency_ms:.1f} ms")
+
+@dp.message(Command("usage"))
+@dp.message(Command("render"))
+@dp.message(Command("status"))
+async def cmd_usage(message: types.Message, bot: Bot):
+    text, markup = await build_usage_card_text(bot)
+    await message.reply(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+@dp.callback_query(F.data == "usage:refresh")
+@dp.callback_query(F.data == "usage:show")
+async def cb_usage_refresh(callback: types.CallbackQuery, bot: Bot):
+    text, markup = await build_usage_card_text(bot)
+    try:
+        await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    except TelegramBadRequest:
+        pass
+    await callback.answer("Metrics refreshed.")
 
 @dp.message(Command("restart"))
 async def cmd_restart(message: types.Message, bot: Bot):
@@ -123,13 +271,20 @@ async def cmd_restart(message: types.Message, bot: Bot):
         await message.reply("Access denied. Owner only.")
         return
 
-    await message.reply("<b>Restarting...</b>", parse_mode=ParseMode.HTML)
-    print(f"[bot] Owner initiated restart. Re-executing...")
-    
+    reason = message.text.partition(" ")[2].strip() or "Manual owner restart"
+    reason_file = os.path.join(os.path.dirname(__file__), "restart_reason.txt")
+    try:
+        with open(reason_file, "w", encoding="utf-8") as f:
+            f.write(reason)
+    except Exception:
+        pass
+
+    await message.reply(f"<b>Restarting bot...</b>\n<i>Reason: {html.escape(reason)}</i>", parse_mode=ParseMode.HTML)
+    print(f"[bot] Owner initiated restart. Reason: {reason}")
+
     if HTTP_SESSION and not HTTP_SESSION.closed:
         await HTTP_SESSION.close()
     await bot.session.close()
-    
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 @dp.message(Command("help"))
@@ -138,139 +293,76 @@ async def cmd_help(message: types.Message):
         "<b>Help & Usage Instructions</b>\n\n"
         "<b>1. Google Drive Post Formatter:</b>\n"
         "Send your episode message containing a Google Drive link. The bot extracts the file size and formats it.\n\n"
-        "<b>2. Uploader Assistant (Fastmotion / Yandex):</b>\n"
-        "Send your Fastmotion link + optional Yandex link + episode info:\n"
-        "<code>MFS S04 E09 92\n"
-        "https://s.fastmotion.io/.../360p/video.m3u8\n"
-        "https://disk.yandex.com.tr/i/...</code>\n"
-        "The bot will output ready-to-copy lines for GDrive, Bot 1, Bot 2, and the 4 quality captions!"
+        "<b>2. Uploader Assistant:</b>\n"
+        "Send your episode message containing <code>fastmotion.io</code> or <code>yandex.com.tr</code> links.\n\n"
+        "<b>Commands:</b>\n"
+        "• <code>/convert</code> — Paste links to convert\n"
+        "• <code>/upload</code> — Uploader helper guide\n"
+        "• <code>/ping</code> — Gateway latency & uptime\n"
+        "• <code>/usage</code> — Render account & host metrics\n"
+        "• <code>/series</code> — Show all recognized drama codes"
     )
-    await message.reply(
-        help_text,
-        parse_mode=ParseMode.HTML,
-        link_preview_options=types.LinkPreviewOptions(is_disabled=True)
-    )
+    await message.reply(help_text, parse_mode=ParseMode.HTML)
 
 @dp.message(Command("series"))
 async def cmd_series(message: types.Message):
-    lines = [f"• <code>{code}</code> ➔ <b>{name}</b>" for code, name in sorted(SERIES_MAP.items())]
-    text = (
-        "<b>Recognized Series:</b>\n\n"
-        + "\n".join(lines)
-    )
-    await message.reply(
-        text,
-        parse_mode=ParseMode.HTML,
-        link_preview_options=types.LinkPreviewOptions(is_disabled=True)
-    )
+    lines = ["<b>Supported Drama Series Codes:</b>\n"]
+    seen = set()
+    for code, full_name in sorted(SERIES_MAP.items()):
+        if full_name not in seen:
+            lines.append(f"• <b>{code}</b>: {full_name}")
+            seen.add(full_name)
+    await message.reply("\n".join(lines), parse_mode=ParseMode.HTML)
 
-async def send_uploader_response(message: types.Message, raw_text: str):
-    """Processes episode uploader request and replies with tap-to-copy blocks and captions."""
-    data = generate_uploader_data(raw_text)
-    
-    # Message 1: Uploader Bot Links
-    links_msg = (
-        "<b>🚀 Uploader Bot Links</b> <i>(Tap code box to copy)</i>\n\n"
-        "<b>📁 Google Drive (1080p):</b>\n"
-        f"<code>{data['gdrive_line']}</code>\n\n"
-        "<b>🤖 Bot 1 (360p & 480p):</b>\n"
-        f"<pre>{data['bot1_block']}</pre>\n\n"
-        "<b>🤖 Bot 2 (720p & 1080p):</b>\n"
-        f"<pre>{data['bot2_block']}</pre>"
-    )
-    await message.reply(
-        links_msg,
-        parse_mode=ParseMode.HTML,
-        link_preview_options=types.LinkPreviewOptions(is_disabled=True)
-    )
-    
-    # Message 2: Formatted Captions
-    captions_msg = (
-        "<b>📝 Video Captions</b> <i>(Tap box to copy)</i>\n\n"
-        "<b>📺 360p / 480p / 720p Caption:</b>\n"
-        f"<pre>{data['captions_plain']['720p']}</pre>\n\n"
-        "<b>📺 1080p Caption:</b>\n"
-        f"<pre>{data['captions_plain']['1080p']}</pre>"
-    )
-    await message.reply(
-        captions_msg,
-        parse_mode=ParseMode.HTML,
-        link_preview_options=types.LinkPreviewOptions(is_disabled=True)
-    )
-
-@dp.message(Command("upload", "uploader"))
-async def cmd_upload(message: types.Message):
-    target_text = ""
-    if message.reply_to_message:
-        target_text = message.reply_to_message.text or message.reply_to_message.caption or ""
-    if not target_text:
-        parts = message.text.split(maxsplit=1)
-        if len(parts) > 1:
-            target_text = parts[1]
-            
-    if not target_text:
-        await message.reply(
-            "Send or reply with your Fastmotion link and episode info to generate uploader lines.",
-            parse_mode=ParseMode.HTML
-        )
-        return
-
-    await send_uploader_response(message, target_text)
-
-@dp.message(Command("convert", "format"))
+@dp.message(Command("convert"))
 async def cmd_convert(message: types.Message):
-    target_text = ""
-    if message.reply_to_message:
-        target_text = message.reply_to_message.text or message.reply_to_message.caption or ""
-    if not target_text:
-        parts = message.text.split(maxsplit=1)
-        if len(parts) > 1:
-            target_text = parts[1]
-            
-    if not target_text:
-        await message.reply(
-            "Reply to a message with <code>/convert</code> or send <code>/convert &lt;link&gt;</code>.",
-            parse_mode=ParseMode.HTML
-        )
+    payload = message.text.partition(" ")[2].strip()
+    if not payload:
+        await message.reply("Please paste your Google Drive message after <code>/convert</code>.", parse_mode=ParseMode.HTML)
         return
+    await handle_text_message(message, custom_text=payload)
 
-    ids = extract_gdrive_ids(target_text)
-    if not ids:
-        await message.reply("No Google Drive link found.")
+@dp.message(Command("upload"))
+async def cmd_upload(message: types.Message):
+    payload = message.text.partition(" ")[2].strip()
+    if not payload:
+        await message.reply("Please paste your episode message with links after <code>/upload</code>.", parse_mode=ParseMode.HTML)
         return
-
-    cards = await process_text_and_format(HTTP_SESSION, target_text)
-    if cards:
-        for card in cards:
-            await message.reply(
-                card,
-                parse_mode=ParseMode.HTML,
-                link_preview_options=types.LinkPreviewOptions(is_disabled=True)
-            )
-    else:
-        await message.reply("Could not extract details. Check that the link is accessible.")
+    await handle_text_message(message, custom_text=payload)
 
 @dp.message(F.text)
-async def handle_all_messages(message: types.Message):
-    if message.text.startswith("/"):
+async def handle_text_message(message: types.Message, custom_text: str | None = None):
+    text = custom_text or message.text
+    if not text:
         return
 
-    # 1. Check if it's an uploader request (Fastmotion / Yandex / m3u8)
-    if is_uploader_request(message.text):
-        await send_uploader_response(message, message.text)
-        return
-
-    # 2. Check if it's a Google Drive link request
-    ids = extract_gdrive_ids(message.text)
-    if ids:
-        cards = await process_text_and_format(HTTP_SESSION, message.text)
-        if cards:
-            for card in cards:
+    # Check for uploader request
+    if is_uploader_request(text):
+        uploader_blocks = generate_uploader_data(text)
+        if uploader_blocks:
+            for block in uploader_blocks:
                 await message.reply(
-                    card,
+                    block,
                     parse_mode=ParseMode.HTML,
                     link_preview_options=types.LinkPreviewOptions(is_disabled=True)
                 )
+            return
+
+    # Check for Google Drive links
+    gdrive_ids = extract_gdrive_ids(text)
+    if not gdrive_ids:
+        return
+
+    formatted_text = await process_text_and_format(text, HTTP_SESSION)
+    await message.reply(
+        formatted_text,
+        parse_mode=ParseMode.HTML,
+        link_preview_options=types.LinkPreviewOptions(is_disabled=True)
+    )
+
+# ==============================================================================
+# MAIN ENTRYPOINT
+# ==============================================================================
 
 async def main():
     global HTTP_SESSION
@@ -279,28 +371,32 @@ async def main():
         sys.exit(1)
 
     print("Launching Google Drive & Uploader Helper Bot...")
-    
-    # Connection pool for ultra-fast response times
+
+    bot_connector = aiohttp.TCPConnector(
+        limit=100,
+        keepalive_timeout=75,
+        ttl_dns_cache=600,
+        enable_cleanup_closed=True
+    )
+    bot_session = AiohttpSession(connector=bot_connector)
+    bot = Bot(token=BOT_TOKEN, session=bot_session)
+
     connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300, ssl=False, enable_cleanup_closed=True)
     HTTP_SESSION = aiohttp.ClientSession(connector=connector)
-    
-    bot = Bot(token=BOT_TOKEN)
-    
-    # Start Keep-Alive web server in background
+
     runner = await start_web_server()
-    
-    # Ensure any conflicting webhook is cleared before polling
     await bot.delete_webhook(drop_pending_updates=True)
-    
-    # Dispatch clean rich restart notification to owner
-    await send_rich_restart_notification(bot)
-    
+
+    await register_bot_commands(bot)
+    await send_restart_notification(bot)
+
     print("Bot is actively polling. Ready to process messages.")
     try:
         await dp.start_polling(bot)
     finally:
         if HTTP_SESSION and not HTTP_SESSION.closed:
             await HTTP_SESSION.close()
+            await asyncio.sleep(0.25)
         await bot.session.close()
         await runner.cleanup()
 
