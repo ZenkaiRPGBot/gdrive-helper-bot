@@ -372,14 +372,7 @@ async def main():
 
     print("Launching Google Drive & Uploader Helper Bot...")
 
-    bot_connector = aiohttp.TCPConnector(
-        limit=100,
-        keepalive_timeout=75,
-        ttl_dns_cache=600,
-        enable_cleanup_closed=True
-    )
-    bot_session = AiohttpSession(connector=bot_connector)
-    bot = Bot(token=BOT_TOKEN, session=bot_session)
+    bot = Bot(token=BOT_TOKEN)
 
     connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300, ssl=False, enable_cleanup_closed=True)
     HTTP_SESSION = aiohttp.ClientSession(connector=connector)
